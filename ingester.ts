@@ -180,23 +180,65 @@ async function findProcessedSignature(fileName: string, newest: boolean): Promis
   }
 }
 
-async function readSigs(rpc: string, marketplace: string, limit: number, before?: string, until?: string): Promise<any[]> {
+async function readSigs(rpc: string, marketplace: string, isStandard: boolean, limit: number, before?: string, until?: string, maxReturn?: number): Promise<any[]> {
   const connection = new Connection(rpc)
   const marketplaceAddress = new PublicKey(marketplace)
 
-  return await connection.getSignaturesForAddress(marketplaceAddress,
-    {
-      limit, before, until
-    }
-  )
-}
+  return await readSigsOptimized(connection, marketplaceAddress, isStandard, limit, before, until, maxReturn)
+ }
 
-async function readSigsOptimized(connection: Connection, marketplaceAddress: PublicKey, limit: number, before?: string, until?: string): Promise<any[]> {
-  return await connection.getSignaturesForAddress(marketplaceAddress,
+async function readSigsOptimized(connection: Connection, marketplaceAddress: PublicKey, isStandard: boolean, limit: number, before?: string, until?: string, maxReturn?: number): Promise<any[]> {
+  const sigs = await connection.getSignaturesForAddress(marketplaceAddress,
     {
       limit, before, until
     }
   )
+  if (isStandard && until && sigs.length >= limit) {
+    // When we read forward (Standard mode) we need to make sure we fetch all signatures in case
+    // we are more that "limit" transactions behind
+    // We are going to keep pulling until we get all
+    // However, when until is null (first time read, file was empty) we are not going to do that
+    // lest we end up fetching signatures all the way to genesis
+    // Can also be done using recursion
+    let allSigs: any[] = sigs
+    let alreadyFetchedZeroSigs = false
+    while (true) {
+      const moreSigs = await connection.getSignaturesForAddress(marketplaceAddress,
+        {
+          limit, before: allSigs[allSigs.length - 1].signature, until
+        }
+      )
+      if (moreSigs.length > 0) {
+          if (maxReturn) {
+            // when we are in a low resource mode we can specify how many signatures to return
+            // if this value is specified only maxReturn number of oldest signatures of interest
+            // will be returned
+            //allSigs = allSigs.slice(allSigs.length - maxReturn)
+            allSigs = allSigs
+              .slice(allSigs.length - Math.max(0, (maxReturn - moreSigs.length)))
+              .concat(moreSigs)
+            allSigs = allSigs.slice(allSigs.length - maxReturn)
+          } else {
+            allSigs = allSigs.concat(moreSigs)
+          }
+          if (moreSigs.length < limit) {
+            return allSigs
+          }
+          alreadyFetchedZeroSigs = false
+      } else {
+        // if we fetched zero signatures try again in case it was an error
+        // but if it happens again we are going to assume that we are all
+        // caught up
+        if (alreadyFetchedZeroSigs) {
+          return allSigs
+        } else {
+          alreadyFetchedZeroSigs = true
+        }
+      }
+    }
+  } else {
+    return sigs
+  }
 }
 
 async function appendSigsToFile(fileName: string, sigs: any[], args: any): Promise<void> {
@@ -270,7 +312,7 @@ async function partA(rpc: string, args: any, fileName: string): Promise<void> {
       const until = isStandardMode(args) ? lastProcessedSig?.signature : undefined
       // this call can be optimized by maintaining open "connection" and value of "marketplaceAddress"
       // but I kept its provided implementation fir simplicity's sake
-      const sigs = await readSigsOptimized(connection, marketplaceAddress, args.sigFetchSize, before, until);
+      const sigs = await readSigsOptimized(connection, marketplaceAddress, isStandardMode(args), args.sigFetchSize, before, until);
 
       console.log(`Fetched ${sigs.length} sigs.`)
 
@@ -309,7 +351,7 @@ async function partB(rpc: string, args: any, fileName: string): Promise<void> {
     try {
       const before = isStandardMode(args) ? undefined : lastProcessedSig?.signature
       const until = isStandardMode(args) ? lastProcessedSig?.signature : undefined
-      const sigs = await readSigsOptimized(connection, marketplaceAddress, args.sigFetchSize, before, until)
+      const sigs = await readSigsOptimized(connection, marketplaceAddress, isStandardMode(args), args.sigFetchSize, before, until, args.sigFetchSize)
 
       console.log(`Fetched ${sigs.length} sigs.`)
 
@@ -348,7 +390,7 @@ async function partC(rpcs: string[], args: any, fileName: string): Promise<void>
       const until = isStandardMode(args) ? lastProcessedSig?.signature : undefined
 
       const allFetchedSigs = await Promise.all(rpcs
-        .map(async (rpc) => await readSigs(rpc, args.marketplace, args.sigFetchSize, before, until)))
+        .map(async (rpc) => await readSigs(rpc, args.marketplace, isStandardMode(args), args.sigFetchSize, before, until)))
 
       // Take blocks that were returned by at least 2/3 of rpcs
       // (for 3 rpcs - 2)
@@ -372,15 +414,16 @@ async function partC(rpcs: string[], args: any, fileName: string): Promise<void>
 
       console.log(`Fetched ${countedSigs.length} sigs.`)
 
-      // I am going to save those blocks that appear at least 2/3 of the time up
+      // At first, I saved those blocks that appear at least 2/3 of the time up
       // to the first block that appears fewer times (could be 0 blocks if the very
       // first block appears less that 2/3 of times)
-      const firstOneTimeOccurrence = countedSigs.findIndex((s: any) => s.counter < minNumOfOccurrences)
-
-      const sigs = (firstOneTimeOccurrence < 0
-        ? countedSigs
-        : countedSigs.slice(0, firstOneTimeOccurrence))
-        .map((s: any) => s.block)
+      // Based on feedback I am changing implementation here to filter out signatures
+      // that appear lesst than minNumOfOccurrences (1/3) of time and keep the ones
+      // that appear at lest minNumOfOccurrences times (2/3)
+      // In production I would store separately information about signatures that were
+      // filtered out and re-try them at a later time (for example, by storing signatures
+      // before and after signatures and using then as "before" and "until" to fetch skipped signatures
+      const sigs = countedSigs.filter((s: any) => s.counter >= minNumOfOccurrences).map((s: any) => s.block)
 
       if (sigs.length === 0) {
         // try again
